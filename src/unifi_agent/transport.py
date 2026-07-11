@@ -118,10 +118,17 @@ def _build_ssl_context(settings: Settings) -> ssl.SSLContext | bool:
             f"Re-pin after firmware/cert changes with `unifi-agent trust --repin`.",
             file=sys.stderr,
         )
-    ctx = ssl.create_default_context(cafile=str(path))
-    # We connect by IP; the cert CN is unifi.local. Identity is enforced by the pin
-    # (this cert is the only trusted root), so hostname matching is intentionally off.
+    # A FRESH context, not ssl.create_default_context(): the default context applies strict
+    # verify flags (VERIFY_X509_STRICT etc.) that reject UniFi's self-signed console cert,
+    # which carries keyUsage certSign but no basicConstraints CA:TRUE and so fails as a CA.
+    # CERT_REQUIRED against a trust store containing only this exact certificate still pins
+    # hard: any other/MITM cert is rejected (verified against a mismatched cert). We connect
+    # by IP and the cert CN is unifi.local, so hostname matching is intentionally off —
+    # identity is enforced by the pin, not the hostname.
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.verify_mode = ssl.CERT_REQUIRED
     ctx.check_hostname = False
+    ctx.load_verify_locations(cadata=path.read_text())
     return ctx
 
 

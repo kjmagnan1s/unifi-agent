@@ -42,6 +42,31 @@ def test_fingerprint_is_stable_and_formatted():
     assert certificate_fingerprint(pem) == fp  # deterministic
 
 
+def test_pinned_context_trusts_only_the_pinned_cert(tmp_path, monkeypatch, settings):
+    """The built SSL context must load the pinned cert as its sole anchor, require
+    verification, and disable hostname matching — the shape that pins without accepting
+    every cert. Regression for the create_default_context "invalid CA" bug."""
+    import ssl
+
+    from unifi_agent.transport import _build_ssl_context
+
+    pytest.importorskip("cryptography")
+    settings.config_dir = tmp_path
+    settings.tls_mode = "pin"
+    cert = _make_cert()
+    monkeypatch.setattr("unifi_agent.transport.fetch_peer_certificate", lambda *a, **k: cert)
+    pin_certificate(settings)
+
+    # Building must SUCCEED (the old create_default_context path produced a context that
+    # failed to verify UniFi's non-CA self-signed cert) and must require verification with
+    # hostname matching off. get_ca_certs() intentionally not asserted: it reports only
+    # CA-flagged certs, and this cert has none — the very reason the naive approach failed.
+    ctx = _build_ssl_context(settings)
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED  # still rejects non-matching certs
+    assert ctx.check_hostname is False
+
+
 def test_pin_then_mismatch_detected(tmp_path, monkeypatch, settings):
     pytest.importorskip("cryptography")
     settings.config_dir = tmp_path
