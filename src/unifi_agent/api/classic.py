@@ -37,18 +37,22 @@ class ClassicClient:
         return f"/proxy/network/api/s/{self.settings.site}"
 
     async def _request(
-        self, method: str, path: str, *, json: Any = None, mutating: bool = False
+        self, method: str, path: str, *, json: Any = None, mutating: bool = False,
+        timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         await self.session.ensure_login()
         url = f"{self._base}{path}"
         headers = self.session.headers(mutating=mutating)
-        resp = await self.transport.request(method, url, json=json, headers=headers)
+        kw: dict[str, Any] = {"json": json, "headers": headers}
+        if timeout is not None:
+            kw["timeout"] = timeout
+        resp = await self.transport.request(method, url, **kw)
 
         if is_login_required(resp):
             log.info("Classic session stale; re-authenticating")
             await self.session.ensure_login(force=True)
-            headers = self.session.headers(mutating=mutating)
-            resp = await self.transport.request(method, url, json=json, headers=headers)
+            kw["headers"] = self.session.headers(mutating=mutating)
+            resp = await self.transport.request(method, url, **kw)
 
         self.session.update_from_response(resp)
         raise_for_meta(resp, url)
@@ -60,8 +64,10 @@ class ClassicClient:
     async def get(self, path: str) -> list[dict[str, Any]]:
         return await self._request("GET", path)
 
-    async def post(self, path: str, body: dict[str, Any]) -> list[dict[str, Any]]:
-        return await self._request("POST", path, json=body, mutating=True)
+    async def post(
+        self, path: str, body: dict[str, Any], *, timeout: float | None = None
+    ) -> list[dict[str, Any]]:
+        return await self._request("POST", path, json=body, mutating=True, timeout=timeout)
 
     async def put(self, path: str, body: dict[str, Any]) -> list[dict[str, Any]]:
         return await self._request("PUT", path, json=body, mutating=True)
@@ -228,9 +234,11 @@ class ClassicClient:
     async def list_backups(self) -> list[dict[str, Any]]:
         return await self.post("/cmd/backup", {"cmd": "list-backups"})
 
-    async def create_backup(self, days: int = -1) -> list[dict[str, Any]]:
-        """Trigger a config backup. ``days=-1`` includes all historical stats."""
-        return await self.post("/cmd/backup", {"cmd": "backup", "days": str(days)})
+    async def create_backup(self, days: int = 0) -> list[dict[str, Any]]:
+        """Trigger a backup. ``days=0`` = config only (fast; the sensible restore point);
+        ``days=-1`` = include all historical stats (large and slow). Uses a longer timeout
+        because the console can take well over the default 30s to build the archive."""
+        return await self.post("/cmd/backup", {"cmd": "backup", "days": str(days)}, timeout=180)
 
     async def delete_backup(self, filename: str) -> list[dict[str, Any]]:
         return await self.post("/cmd/backup", {"cmd": "delete-backup", "filename": filename})
@@ -243,8 +251,11 @@ class ClassicClient:
         use the ``autobackup`` subpath). A bare ``/dl/...`` hits the UniFi OS root and 404s.
         """
         await self.session.ensure_login()
-        if filename.startswith("/"):
+        if filename.startswith("/proxy/network"):
             url = filename
+        elif filename.startswith("/"):
+            # API returns download paths relative to the Network app (e.g. /dl/backup/x.unf).
+            url = f"/proxy/network{filename}"
         else:
             sub = "autobackup" if filename.startswith("autobackup") else "backup"
             url = f"/proxy/network/dl/{sub}/{filename}"

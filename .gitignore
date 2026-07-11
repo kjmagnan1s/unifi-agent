@@ -6,7 +6,11 @@
 *.unf
 *.key
 config.local.*
-secrets.*
+# secret data files only — NOT the src/unifi_agent/secrets.py module (anchored + typed)
+/secrets.json
+/secrets.yaml
+/secrets.yml
+secrets.local.*
 audit/
 *.audit.jsonl
 

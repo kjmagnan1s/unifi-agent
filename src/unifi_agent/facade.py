@@ -468,7 +468,7 @@ class UniFiAgent:
             apply=lambda: self._require_classic().unauthorize_guest(mac),
         )
 
-    async def create_backup(self, days: int = -1) -> dict[str, Any]:
+    async def create_backup(self, days: int = 0) -> dict[str, Any]:
         """Create a config backup. Blast radius is none, but it is still a write, so it
         respects read-only mode (the documented "no mutation is ever sent" contract)."""
         if self.settings.read_only:

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  unifi-agent monitoring LaunchAgent (macOS).
+  Runs one read-only diagnostic pass on a schedule and appends a JSONL line to the log.
+  Render the __PLACEHOLDERS__ and install per deploy/install-monitor.sh (or docs/MONITORING.md).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.unifi-agent.monitor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UNIFI_AGENT_BIN__</string>
+    <string>watch</string>
+    <string>--iterations</string>
+    <string>1</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>UNIFI_HOST</key>
+    <string>__UNIFI_HOST__</string>
+    <!-- The monitor only reads; force read-only so it can never mutate the network. -->
+    <key>UNIFI_READ_ONLY</key>
+    <string>true</string>
+  </dict>
+
+  <!-- Every 10 minutes. launchd defers while asleep and runs once on wake. -->
+  <key>StartInterval</key>
+  <integer>600</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- launchd opens these append-only, so the JSONL log accumulates one line per run. -->
+  <key>StandardOutPath</key>
+  <string>__CONFIG_DIR__/monitor.jsonl</string>
+  <key>StandardErrorPath</key>
+  <string>__CONFIG_DIR__/monitor.err</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
