@@ -11,9 +11,10 @@ the threat model and the rules the code enforces.
    generates is *outbound* to your gateway on the LAN. There is nothing to port-scan and
    nothing to reach from the internet.
 2. **Local-first.** All management traffic goes directly to the gateway's LAN address over
-   HTTPS. Nothing is proxied through Ubiquiti's cloud. Remote control is achieved by
-   connecting back into the LAN over your existing VPN (see below), not by exposing the
-   tool.
+   HTTPS. A `UNIFI_HOST` with any other scheme (such as `http://`) is refused, so
+   credentials never travel in plaintext. Nothing is proxied through Ubiquiti's cloud.
+   Remote control is achieved by connecting back into the LAN over your existing VPN (see
+   below), not by exposing the tool.
 3. **Least privilege.** Use a dedicated, local-only, least-privilege admin — never your
    owner/Super-Admin account. API keys inherit the creating admin's role, so mint them
    from a scoped admin.
@@ -68,7 +69,8 @@ Every write flows through a guard that enforces, in order:
 Additionally:
 
 - **Pre-change backup**: mutations at `wlan_group` radius and above trigger a `.unf`
-  snapshot first (when a local admin is configured).
+  snapshot first (when a local admin is configured). If the backup fails or returns no
+  restore point, the mutation is aborted.
 - **Race mitigation**: radio and WLAN edits re-fetch the object immediately before writing
   and send the complete object, because the API has no revision IDs (last write wins).
 - **Audit log**: every attempt — preview, allowed, refused, result — is appended as a

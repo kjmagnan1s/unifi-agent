@@ -3,7 +3,7 @@
 <!--
   unifi-agent monitoring LaunchAgent (macOS).
   Runs one read-only diagnostic pass on a schedule and appends a JSONL line to the log.
-  Render the __PLACEHOLDERS__ and install per deploy/install-monitor.sh (or docs/MONITORING.md).
+  Render the __PLACEHOLDERS__ and install per deploy/install-monitor.sh.
 -->
 <plist version="1.0">
 <dict>
