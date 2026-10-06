@@ -13,9 +13,9 @@ class FakeClassicForLoops:
 
     async def devices(self):
         return [
-            {"_id": "gw", "mac": "28:70:4e:36:7e:73", "model": "UCGMAX", "type": "udm",
+            {"_id": "gw", "mac": "aa:bb:cc:00:00:02", "model": "UCGMAX", "type": "udm",
              "state": 1, "num_sta": 30, "radio_table": []},
-            {"_id": "ap1", "mac": "9c:05:d6:0d:04:bc", "name": "Main", "model": "UAPL6",
+            {"_id": "ap1", "mac": "aa:bb:cc:00:00:01", "name": "Main", "model": "UAPL6",
              "type": "uap", "state": 1, "num_sta": 7,
              "radio_table": [{"radio": "ng", "channel": 3, "ht": 20},
                              {"radio": "na", "channel": 44, "ht": 80}]},

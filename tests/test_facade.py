@@ -15,7 +15,7 @@ class FakeClassic:
         self.blocked = []
         self.backups = 0
         self._device = {
-            "_id": "dev1", "mac": "9c:05:d6:0d:04:bc", "name": "Main Floor U6+", "type": "uap",
+            "_id": "dev1", "mac": "aa:bb:cc:00:00:01", "name": "Main Floor U6+", "type": "uap",
             "state": 1, "radio_table": [
                 {"radio": "ng", "name": "ra0", "channel": "auto", "ht": 20, "tx_power_mode": "auto"},
                 {"radio": "na", "name": "rai0", "channel": "auto", "ht": 80, "tx_power_mode": "auto"},
@@ -23,7 +23,7 @@ class FakeClassic:
         }
 
         self._gateway = {
-            "_id": "gw1", "mac": "28:70:4e:36:7e:73", "name": "Cloud Gateway Max",
+            "_id": "gw1", "mac": "aa:bb:cc:00:00:02", "name": "Cloud Gateway Max",
             "type": "udm", "state": 1, "radio_table": [],
         }
         self.restarted = []
@@ -67,7 +67,8 @@ class FakeClassic:
         self._st_seq = seq + 1
         if seq == 0:
             return {"rundate": 1000, "xput_download": 111, "xput_upload": 11}  # stale
-        return {"rundate": 2000, "xput_download": 950, "xput_upload": 42, "latency": 15}
+        return {"rundate": 2000, "xput_download": 950, "xput_upload": 42, "latency": 15,
+                "status_download": 2, "status_upload": 2}
 
 
 @pytest.fixture
@@ -166,7 +167,7 @@ async def test_restart_gateway_is_gateway_blast_radius(agent):
 async def test_restart_ap_is_device_and_allowed(agent):
     res = await agent.restart_device("Main Floor U6+", confirm=True)
     assert res["applied"] is True
-    assert agent._classic.restarted == ["9c:05:d6:0d:04:bc"]
+    assert agent._classic.restarted == ["aa:bb:cc:00:00:01"]
 
 
 async def test_restart_gateway_override_warns_about_wan(settings):
@@ -190,3 +191,51 @@ async def test_capabilities_reports_both_apis(agent):
     caps = await agent.capabilities()
     assert caps["integration_api"] is True and caps["classic_api"] is True
     assert caps["max_blast_radius"] == "device"
+
+
+async def test_required_backup_failure_prevents_wlan_change(settings):
+    from unittest.mock import AsyncMock
+
+    from unifi_agent.errors import UniFiAgentError
+
+    settings.max_blast_radius = BlastRadius.SITE
+    settings.backup_before_risky = True
+    a = UniFiAgent(settings)
+    a._classic = FakeClassic()
+    a._classic.create_backup = AsyncMock(side_effect=RuntimeError('backup failed'))
+    with pytest.raises(UniFiAgentError, match='backup failed'):
+        await a.toggle_wlan('Home', False, confirm=True)
+    assert a._classic.puts == []
+
+
+async def test_unknown_restart_target_is_refused(agent):
+    from unifi_agent.errors import UniFiAgentError
+
+    with pytest.raises(UniFiAgentError, match='known device'):
+        await agent.restart_device('ff:ff:ff:ff:ff:ff', confirm=True)
+    assert agent._classic.restarted == []
+
+
+async def test_speedtest_does_not_accept_incomplete_upload(agent, monkeypatch):
+    import asyncio as _asyncio
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(_asyncio, 'sleep', lambda *_a, **_k: _noop())
+    agent._classic.speedtest_status = AsyncMock(side_effect=[
+        {'rundate': 1},
+        {'rundate': 2, 'xput_download': 793, 'xput_upload': 0,
+         'status_download': 2, 'status_upload': 1},
+        {'rundate': 2, 'xput_download': 793, 'xput_upload': 15,
+         'status_download': 2, 'status_upload': 2},
+    ])
+    result = await agent.run_speedtest(confirm=True, timeout_s=9)
+    assert result['result']['upload_mbps'] == 15
+    assert agent._classic.speedtest_status.call_count == 3
+
+
+def test_plaintext_host_rejected(settings):
+    from unifi_agent.errors import ConfigError
+
+    settings.host = 'http://192.168.1.1'
+    with pytest.raises(ConfigError, match='HTTPS'):
+        _ = settings.base_url

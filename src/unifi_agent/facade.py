@@ -250,9 +250,12 @@ class UniFiAgent:
                 and self.settings.has_classic_auth()):
             try:
                 snapshot = await self.classic.create_backup()
+                if not snapshot:
+                    raise UniFiAgentError("Backup returned no restore point")
                 log.info("Pre-change backup created for %s", op_name)
             except Exception as exc:  # noqa: BLE001
-                log.warning("Pre-change backup failed (continuing): %s", exc)
+                self.audit.record("mutation.failed", {"operation": op_name, "stage": "backup"})
+                raise UniFiAgentError("Required backup failed; mutation aborted") from exc
 
         result = await apply()
         self.audit.record("mutation.result", {"operation": op_name, "details": details})
@@ -325,7 +328,9 @@ class UniFiAgent:
         override_blast_radius: bool = False,
     ) -> dict[str, Any]:
         device = await self._find_device(mac)
-        target = device["mac"] if device else mac
+        if device is None:
+            raise UniFiAgentError("Restart target must resolve to a known device")
+        target = device["mac"]
         # Rebooting the gateway takes the whole network (and this session) down, so it must
         # be classified GATEWAY — not DEVICE — to trip the ceiling and the self-lockout warning.
         is_gateway = bool(device and device.get("type") in self._GATEWAY_TYPES)
@@ -354,7 +359,8 @@ class UniFiAgent:
                 st = await self.classic.speedtest_status()
                 rundate = st.get("rundate")
                 is_new = rundate is not None and rundate != prev_rundate
-                if is_new and st.get("xput_download") is not None:
+                if (is_new and st.get("status_download") == 2 and st.get("status_upload") == 2
+                        and (st.get("xput_download") or 0) > 0 and (st.get("xput_upload") or 0) > 0):
                     return {"download_mbps": st.get("xput_download"),
                             "upload_mbps": st.get("xput_upload"),
                             "latency_ms": st.get("latency"), "rundate": rundate}
