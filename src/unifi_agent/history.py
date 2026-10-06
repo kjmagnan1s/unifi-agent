@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .errors import UniFiAgentError
 from .secrets import redact
 
 
@@ -54,10 +55,6 @@ class History:
                 id INTEGER PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id),
                 at TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS reviews (
-                id INTEGER PRIMARY KEY, scan_id TEXT NOT NULL REFERENCES scans(id),
-                at TEXT NOT NULL, payload TEXT NOT NULL
-            );
             PRAGMA user_version=1;
         """)
 
@@ -97,7 +94,7 @@ class History:
     def get(self, scan_id: str) -> dict:
         row = self.db.execute("SELECT payload FROM scans WHERE id=?", (scan_id,)).fetchone()
         if row is None:
-            raise ValueError(f"Unknown scan {scan_id}")
+            raise UniFiAgentError(f"Unknown scan {scan_id}")
         return json.loads(row[0])
 
     def latest(self, host: str, site: str) -> dict | None:
@@ -156,19 +153,11 @@ class History:
             result.append(entry)
         return result
 
-    def review(self, scan_id: str, payload: dict) -> None:
-        with self.db:
-            self.db.execute(
-                "INSERT INTO reviews(scan_id,at,payload) VALUES (?,?,?)",
-                (scan_id, now(), json.dumps(redact(payload))),
-            )
-
-    def reviews(self, scan_id: str | None = None) -> list[dict]:
-        rows = self.db.execute(
-            "SELECT * FROM reviews WHERE (? IS NULL OR scan_id=?) ORDER BY id DESC LIMIT 50",
-            (scan_id, scan_id),
-        )
-        return [{**dict(r), "payload": json.loads(r["payload"])} for r in rows]
+    def experiment_entry(self, experiment_id: str) -> dict:
+        entry = next((e for e in self.experiments() if e["id"] == experiment_id), None)
+        if entry is None:
+            raise UniFiAgentError(f"Unknown experiment {experiment_id}")
+        return entry
 
 
 def counter_delta(before: dict, after: dict, elapsed_s: float, key: str) -> dict:

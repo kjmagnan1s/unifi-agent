@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import re
 import shutil
+import socket
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -92,8 +93,15 @@ def error_record(exc: Exception) -> dict:
 
 
 async def ping(target: str, count: int = 10) -> dict:
-    """Numeric IPs only; no shell. ICMP unavailable is not proof the device is offline."""
-    ipaddress.ip_address(target)
+    """Pings a numeric address; no shell. ICMP unavailable is not proof the device is offline."""
+    try:
+        address = str(ipaddress.ip_address(target))
+    except ValueError:
+        try:
+            infos = await asyncio.get_running_loop().getaddrinfo(target, None, type=socket.SOCK_STREAM)
+            address = str(ipaddress.ip_address(infos[0][4][0]))
+        except (OSError, ValueError, IndexError):
+            return {"target": target, "status": "invalid_target", "loss_pct": None, "mean_ms": None}
     executable = shutil.which("ping")
     if not executable:
         return {"target": target, "status": "unavailable"}
@@ -102,7 +110,7 @@ async def ping(target: str, count: int = 10) -> dict:
         "-n",
         "-c",
         str(count),
-        target,
+        address,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env={"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},

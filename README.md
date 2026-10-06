@@ -141,4 +141,6 @@ The Tuesday maintenance workflow uses `network-tune`, `network-outcome`, and
 are chosen automatically by the scanner: the scheduled agent assesses evidence, records
 a hypothesis, verifies results and accepts or rolls back each experiment. The maintenance
 executor has its own narrow validation and recovery checks; it does not expose arbitrary
-network writes. Monitoring notes and network plans are kept outside this repository.
+network writes. Its writes are audited and respect `UNIFI_MAX_BLAST_RADIUS`: radio changes
+are `device`, and Smart Queue changes are `gateway`. Rollbacks restore the recorded settings
+even above the ceiling. Monitoring notes and network plans are kept outside this repository.

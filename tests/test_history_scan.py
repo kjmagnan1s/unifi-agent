@@ -7,11 +7,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from unifi_agent.errors import UniFiAgentError
+from unifi_agent.errors import BlastRadiusError, UniFiAgentError
 from unifi_agent.facade import UniFiAgent
 from unifi_agent.history import History, compare, counter_delta
-from unifi_agent.maintenance import _write, experiment, in_window, validate_plan
-from unifi_agent.scan import assessment, collect, device_record, speed_result
+from unifi_agent.maintenance import _write, experiment, in_window, rollback, validate_plan
+from unifi_agent.scan import assessment, collect, device_record, ping, speed_result
 
 
 def snapshot(identifier="s1", at="2026-09-15T07:00:00+00:00"):
@@ -46,13 +46,11 @@ def test_persistence_redaction_and_reopen(tmp_path):
         h.save(s)
         e = h.experiment("s1", "radio", "coverage", {"before": {"channel": 1}})
         h.event(e, "aborted", {"reason": "backup"})
-        h.review("s1", {"decision": "no change"})
     with History(path) as h:
         assert h.get("s1")["nested"]["password"] == "***REDACTED***"
         assert h.latest("other", "default") is None
         assert h.latest("10.0.0.1", "default")["id"] == "s1"
         assert h.experiments()[0]["events"][-1]["status"] == "aborted"
-        assert h.db.execute("select count(*) from reviews").fetchone()[0] == 1
     assert path.stat().st_mode & 0o777 == 0o600
     assert b"do-not-store" not in path.read_bytes()
 
@@ -301,14 +299,139 @@ async def test_failed_verification_rolls_back_and_records_outcome(settings, tmp_
     assert c.put_device.call_count == 2
 
 
-def test_read_only_history_and_reviews(tmp_path):
+def test_read_only_history_and_unknown_ids(tmp_path):
     path = tmp_path / "h.db"
     with History(path) as h:
         h.save(snapshot())
-        h.review("s1", {"decision": "baseline_only"})
     with History(path, read_only=True) as h:
-        assert h.reviews("s1")[0]["payload"]["decision"] == "baseline_only"
-        assert h.reviews("missing") == []
+        assert h.get("s1")["id"] == "s1"
+        with pytest.raises(UniFiAgentError, match="Unknown scan"):
+            h.get("missing")
+        with pytest.raises(UniFiAgentError, match="Unknown experiment"):
+            h.experiment_entry("missing")
+
+
+async def test_ping_reports_unresolvable_hostname_without_raising():
+    result = await ping("no-such-host.invalid", 1)
+    assert result["status"] == "invalid_target"
+    assert result["target"] == "no-such-host.invalid"
+
+
+def radio_agent(settings, device):
+    a = UniFiAgent(settings)
+    a.transport.start = AsyncMock()
+    c = AsyncMock()
+    a._classic = c
+    c.device.side_effect = lambda *args: deepcopy(device)
+
+    async def put(identifier, payload):
+        device["radio_table"] = deepcopy(payload["radio_table"])
+
+    c.put_device.side_effect = put
+    c.create_backup.return_value = [{"filename": "backup.unf"}]
+    c.download_backup.return_value = b"x" * 256
+    return a, c
+
+
+def radio_device(channel):
+    return {
+        "_id": "id",
+        "type": "uap",
+        "model": "UAPL6",
+        "country_code": 840,
+        "state": 1,
+        "radio_table": [{"radio": "ng", "channel": channel, "ht": "20"}],
+    }
+
+
+def radio_baseline():
+    s = snapshot()
+    for sample in s["samples"]:
+        sample["devices"] = [
+            {"mac": "ap", "radios": [{"radio": "ng", "channel": "1", "width_mhz": "20"}]}
+        ]
+    return s
+
+
+async def test_drift_before_apply_aborts_without_write(settings, tmp_path, monkeypatch):
+    import unifi_agent.maintenance as maintenance
+
+    device = radio_device("1")
+    a, c = radio_agent(settings, device)
+    monkeypatch.setattr(maintenance, "validate_plan", lambda *args: None)
+
+    def window():
+        device["radio_table"][0]["channel"] = 11
+        return True
+
+    monkeypatch.setattr(maintenance, "in_window", window)
+    with History(tmp_path / "h.db") as h:
+        h.save(radio_baseline())
+        with pytest.raises(UniFiAgentError, match="Settings changed"):
+            await experiment(a, h, plan())
+        statuses = [e["status"] for e in h.experiments()[0]["events"]]
+        assert statuses[-1] == "aborted" and "applying" not in statuses
+    c.put_device.assert_not_called()
+
+
+async def test_string_controller_values_roll_back_and_audit(settings, tmp_path, monkeypatch):
+    import unifi_agent.maintenance as maintenance
+
+    device = radio_device("1")
+    a, c = radio_agent(settings, device)
+    monkeypatch.setattr(maintenance, "validate_plan", lambda *args: None)
+    monkeypatch.setattr(maintenance, "in_window", lambda: True)
+    monkeypatch.setattr(maintenance.asyncio, "sleep", AsyncMock())
+    monkeypatch.setattr(maintenance, "ping", AsyncMock(return_value={"loss_pct": 100}))
+    with History(tmp_path / "h.db") as h:
+        h.save(radio_baseline())
+        with pytest.raises(UniFiAgentError, match="latency"):
+            await experiment(a, h, plan())
+        assert h.experiments()[0]["events"][-1]["status"] == "rolled_back"
+    assert device["radio_table"][0]["channel"] == 1
+    events = [
+        json.loads(line)
+        for f in settings.audit_dir.glob("audit-*.jsonl")
+        for line in f.read_text().splitlines()
+    ]
+    results = [e for e in events if e["event"] == "mutation.result"]
+    assert [e["operation"] for e in results] == ["set_radio", "set_radio"]
+
+
+async def test_rollback_clears_recovery_when_already_restored(settings, tmp_path):
+    device = radio_device(1)
+    a, c = radio_agent(settings, device)
+    p = {**plan(), "before": {"channel": 1, "ht": 20}, "after": {"channel": 6, "ht": 20}}
+    with History(tmp_path / "h.db") as h:
+        h.save(snapshot())
+        e = h.experiment("s1", "radio", "coverage", p)
+        h.event(e, "applying", {})
+        h.event(e, "recovery_required", {})
+        await rollback(a, h, e)
+        assert h.experiment_entry(e)["events"][-1]["status"] == "rolled_back"
+        with pytest.raises(UniFiAgentError, match="Unknown experiment"):
+            await rollback(a, h, "missing")
+    c.put_device.assert_not_called()
+
+
+async def test_smart_queue_experiment_respects_blast_radius_ceiling(settings, tmp_path, monkeypatch):
+    import unifi_agent.maintenance as maintenance
+
+    monkeypatch.setattr(maintenance, "validate_plan", lambda *args: None)
+    a = UniFiAgent(settings)
+    a.transport.start = AsyncMock()
+    c = AsyncMock()
+    a._classic = c
+    p = {**plan(), "kind": "smartq", "target": "wan", "changes": {"wan_smartq_enabled": True}}
+    s = snapshot(at=datetime.now(UTC).isoformat())
+    s["speedtest"] = {"new_this_scan": True}
+    with History(tmp_path / "h.db") as h:
+        h.save(s)
+        with pytest.raises(BlastRadiusError):
+            await experiment(a, h, p)
+        assert h.experiments() == []
+    c.create_backup.assert_not_called()
+    c.put.assert_not_called()
 
 
 def test_smart_queue_requires_completed_baseline_test():

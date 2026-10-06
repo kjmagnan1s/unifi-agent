@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -34,12 +36,18 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-def _run(coro: Any) -> Any:
+@contextmanager
+def _errors() -> Iterator[None]:
     try:
-        return asyncio.run(coro)
+        yield
     except UniFiAgentError as exc:
         err_console.print(f"[red]{type(exc).__name__}:[/red] {exc}")
         raise typer.Exit(1) from exc
+
+
+def _run(coro: Any) -> Any:
+    with _errors():
+        return asyncio.run(coro)
 
 
 def _emit(data: Any, as_json: bool) -> None:
@@ -391,28 +399,13 @@ def network_scan(
 
 @app.command(name="network-history")
 def network_history(database: Path | None = None, scan_id: str | None = None,
-                    limit: int = typer.Option(12, min=1, max=100), experiments: bool = False,
-                    reviews: bool = False) -> None:
+                    limit: int = typer.Option(12, min=1, max=100), experiments: bool = False) -> None:
     """Read saved scans or the experiment journal without connecting to the network."""
     from .history import History
 
-    with History(database, read_only=True) as history:
-        if reviews:
-            result = history.reviews(scan_id)
-        else:
-            result = history.get(scan_id) if scan_id else (history.experiments() if experiments else history.list(limit))
+    with _errors(), History(database, read_only=True) as history:
+        result = history.get(scan_id) if scan_id else (history.experiments() if experiments else history.list(limit))
     _emit(result, True)
-
-
-@app.command(name="network-review")
-def network_review(scan_id: str, assessment_file: Path, database: Path | None = None) -> None:
-    """Attach the weekly assessment JSON, including issues, decisions and next steps."""
-    from .history import History
-
-    payload = jsonlib.loads(assessment_file.read_text())
-    with History(database) as history:
-        history.review(scan_id, payload)
-    _emit({"recorded": True, "scan_id": scan_id}, True)
 
 
 @app.command(name="network-tune")
@@ -423,7 +416,8 @@ def network_tune(plan_file: Path, database: Path | None = None, confirm: bool = 
 
     plan = jsonlib.loads(plan_file.read_text())
     with History(database) as history:
-        validate_plan(plan, history.get(plan["baseline_id"]))
+        with _errors():
+            validate_plan(plan, history.get(plan["baseline_id"]))
         if not confirm:
             _emit({"applied": False, "plan": plan}, True)
             return
@@ -452,8 +446,8 @@ def network_outcome(experiment_id: str, evidence_file: Path, database: Path | No
     evidence = jsonlib.loads(evidence_file.read_text())
     if not all(evidence.get(k) for k in ("post_scan_id", "measured_benefit", "regression_checks")):
         raise typer.BadParameter("Outcome needs post_scan_id, measured_benefit and regression_checks")
-    with History(database) as history:
-        entry = next(e for e in history.experiments() if e["id"] == experiment_id)
+    with _errors(), History(database) as history:
+        entry = history.experiment_entry(experiment_id)
         if entry["events"][-1]["status"] != "pending_assessment":
             raise typer.BadParameter("Only pending_assessment experiments can be accepted")
         linked_id = entry["events"][-1]["payload"]["post_scan_id"]

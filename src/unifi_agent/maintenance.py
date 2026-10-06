@@ -15,11 +15,29 @@ from zoneinfo import ZoneInfo
 
 from .errors import UniFiAgentError
 from .history import History
+from .operations import OPERATIONS
 from .scan import collect, ping
 
 CENTRAL = ZoneInfo("America/Chicago")
 QUEUE_KEYS = {"wan_smartq_enabled", "wan_smartq_up_rate", "wan_smartq_down_rate"}
 RADIO_KEYS = {"channel", "ht", "tx_power_mode", "tx_power"}
+
+
+def _norm(value: Any) -> Any:
+    return int(value) if isinstance(value, str) and value.isdigit() else value
+
+
+def _settings(plan: dict, settings: dict) -> dict:
+    keys = RADIO_KEYS if plan["kind"] == "radio" else QUEUE_KEYS
+    return {k: _norm(settings[k]) for k in keys if k in settings}
+
+
+def _matches(settings: dict, expected: dict) -> bool:
+    return all(settings.get(k) == v for k, v in expected.items())
+
+
+def _operation(plan: dict):
+    return OPERATIONS["set_radio" if plan["kind"] == "radio" else "update_wan_queue"]
 
 
 def in_window(at: datetime | None = None) -> bool:
@@ -121,25 +139,53 @@ async def _target(agent, plan: dict) -> tuple[dict, dict]:
     return matches[0], matches[0]
 
 
-async def _write(agent, plan: dict, expected: dict, replacement: dict) -> None:
-    """Re-fetch and reject drift; preserve fields outside the experiment."""
+async def _unchanged(agent, plan: dict, expected: dict) -> dict:
+    """Re-fetch and reject drift before any write."""
     target, settings = await _target(agent, plan)
-    keys = RADIO_KEYS if plan["kind"] == "radio" else QUEUE_KEYS
-    current = {k: settings[k] for k in keys if k in settings}
-    if current != expected:
+    if _settings(plan, settings) != expected:
         raise UniFiAgentError(
             "Settings changed since preview; refusing to overwrite concurrent edits"
         )
+    return target
+
+
+async def _put(agent, plan: dict, target: dict, replacement: dict, *, recovery: bool) -> None:
+    """Guarded, audited write that preserves fields outside the experiment."""
+    details = {"target": plan["target"], "kind": plan["kind"], "settings": replacement}
+    agent.guard.evaluate(
+        _operation(plan), confirm=True, dry_run=False,
+        override_blast_radius=recovery, details=details,
+    )
     if plan["kind"] == "radio":
         table = copy.deepcopy(target["radio_table"])
         radio = next(r for r in table if r.get("radio") == plan["band"])
-        for k in keys:
+        for k in RADIO_KEYS:
             radio.pop(k, None)
         radio.update(replacement)
         await agent.classic.put_device(target["_id"], {"radio_table": table})
     else:
         # Queue keys must all be present in the original so rollback is exact.
         await agent.classic.put(f"/rest/networkconf/{target['_id']}", replacement)
+    agent.audit.record("mutation.result", {"operation": _operation(plan).name, "details": details})
+
+
+async def _write(
+    agent, plan: dict, expected: dict, replacement: dict, *, recovery: bool = False
+) -> None:
+    target = await _unchanged(agent, plan, expected)
+    await _put(agent, plan, target, replacement, recovery=recovery)
+
+
+async def _restore(agent, plan: dict, before: dict, after: dict) -> None:
+    """Return to ``before``; a target already there needs no write."""
+    _, settings = await _target(agent, plan)
+    if _matches(_settings(plan, settings), before):
+        return
+    await _write(agent, plan, after, before, recovery=True)
+    await asyncio.sleep(60)
+    _, restored = await _target(agent, plan)
+    if not _matches(_settings(plan, restored), before):
+        raise UniFiAgentError("Rollback read-back mismatch")
 
 
 async def experiment(agent, history: History, plan: dict) -> dict[str, Any]:
@@ -154,6 +200,10 @@ async def _experiment(agent, history: History, plan: dict) -> dict[str, Any]:
         raise UniFiAgentError("Maintenance is disabled by UNIFI_READ_ONLY")
     if (baseline["host"], baseline["site"]) != (agent.settings.host, agent.settings.site):
         raise UniFiAgentError("Baseline belongs to another network")
+    agent.guard.evaluate(
+        _operation(plan), confirm=False, dry_run=True,
+        details={"target": plan.get("target"), "kind": plan["kind"]},
+    )
     recent = datetime.now(UTC) - timedelta(days=6)
     for prior in history.experiments():
         statuses = {e["status"] for e in prior["events"]}
@@ -171,8 +221,7 @@ async def _experiment(agent, history: History, plan: dict) -> dict[str, Any]:
             raise UniFiAgentError("Unresolved experiment requires recovery or assessment first")
     await agent.transport.start()
     _, settings = await _target(agent, plan)
-    keys = RADIO_KEYS if plan["kind"] == "radio" else QUEUE_KEYS
-    before = {k: settings[k] for k in keys if k in settings}
+    before = _settings(plan, settings)
     if plan["kind"] == "radio":
         base_device = next(
             (d for d in baseline["samples"][-1]["devices"] if d.get("mac") == plan["target"]), None
@@ -189,13 +238,13 @@ async def _experiment(agent, history: History, plan: dict) -> dict[str, Any]:
             ("tx_power_mode", "tx_power_mode"),
             ("tx_power", "tx_power"),
         ):
-            if base_radio.get(source) != before.get(dest):
+            if _norm(base_radio.get(source)) != before.get(dest):
                 raise UniFiAgentError("Radio configuration drifted since baseline")
     else:
         base_network = next(
             (n for n in baseline.get("networks", []) if n.get("_id") == plan["target"]), {}
         )
-        if any(base_network.get(k) != before.get(k) for k in QUEUE_KEYS):
+        if any(_norm(base_network.get(k)) != before.get(k) for k in QUEUE_KEYS):
             raise UniFiAgentError("WAN configuration drifted since baseline")
     if plan["kind"] == "smartq" and set(before) != QUEUE_KEYS:
         raise UniFiAgentError("All original queue settings must be present for exact rollback")
@@ -232,13 +281,18 @@ async def _experiment(agent, history: History, plan: dict) -> dict[str, Any]:
     if not in_window():
         history.event(identifier, "aborted", {"stage": "maintenance_window_closed"})
         raise UniFiAgentError("Maintenance window closed while making backup")
+    try:
+        target = await _unchanged(agent, plan, before)
+    except Exception:
+        history.event(identifier, "aborted", {"stage": "drift_check"})
+        raise
     history.event(identifier, "applying", {})
     try:
-        await _write(agent, plan, before, after)
+        await _put(agent, plan, target, after, recovery=False)
         history.event(identifier, "applied", {})
         await asyncio.sleep(60)
         _, actual = await _target(agent, plan)
-        if any(actual.get(k) != v for k, v in after.items()):
+        if not _matches(_settings(plan, actual), after):
             raise UniFiAgentError("Controller read-back does not match experiment")
         probes = await asyncio.gather(*(ping(p["target"]) for p in baseline["latency_idle"]))
         for old, new in zip(baseline["latency_idle"], probes, strict=True):
@@ -279,11 +333,7 @@ async def _experiment(agent, history: History, plan: dict) -> dict[str, Any]:
         history.event(identifier, "verification_failed", {"error_type": type(exc).__name__})
         try:
             await agent.transport.start()
-            await _write(agent, plan, after, before)
-            await asyncio.sleep(60)
-            _, restored = await _target(agent, plan)
-            if any(restored.get(k) != v for k, v in before.items()):
-                raise UniFiAgentError("Rollback read-back mismatch")
+            await _restore(agent, plan, before, after)
             history.event(identifier, "rolled_back", {"reason": "verification_failed"})
         except Exception as rollback_error:
             history.event(
@@ -298,7 +348,7 @@ async def rollback(agent, history: History, identifier: str) -> None:
 
 
 async def _rollback(agent, history: History, identifier: str) -> None:
-    entry = next(e for e in history.experiments() if e["id"] == identifier)
+    entry = history.experiment_entry(identifier)
     if agent.settings.read_only:
         raise UniFiAgentError("Rollback is disabled by UNIFI_READ_ONLY")
     baseline = history.get(entry["baseline_id"])
@@ -306,9 +356,5 @@ async def _rollback(agent, history: History, identifier: str) -> None:
         raise UniFiAgentError("Experiment belongs to another network")
     plan = entry["plan"]
     await agent.transport.start()
-    await _write(agent, plan, plan["after"], plan["before"])
-    await asyncio.sleep(60)
-    _, restored = await _target(agent, plan)
-    if any(restored.get(k) != v for k, v in plan["before"].items()):
-        raise UniFiAgentError("Rollback read-back mismatch")
+    await _restore(agent, plan, plan["before"], plan["after"])
     history.event(identifier, "rolled_back", {"reason": "assessment"})
