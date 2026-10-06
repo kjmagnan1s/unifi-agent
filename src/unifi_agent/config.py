@@ -65,6 +65,8 @@ class Settings:
         host = self.host
         if "://" not in host:
             host = f"https://{host}"
+        if not host.lower().startswith("https://"):
+            raise ConfigError("UNIFI_HOST must use HTTPS; plaintext authentication is forbidden.")
         return host.rstrip("/")
 
     @property

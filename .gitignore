@@ -13,6 +13,11 @@ config.local.*
 secrets.local.*
 audit/
 *.audit.jsonl
+# Private network histories and recovery archives
+*.sqlite3
+*.sqlite3-*
+/data/
+/reports/
 
 # Python
 __pycache__/
@@ -32,3 +37,8 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# Private network documents (audits, monitoring notes, future-state plans) live outside the repo
+/docs/AUDIT-*.md
+/docs/MONITORING.md
+/docs/NETWORK-FUTURE-STATE.md

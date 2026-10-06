@@ -29,7 +29,7 @@ of every operation. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - **Full control (guarded):** set radio channel/width/TX-power, enable/disable WLANs,
   block/unblock/kick clients, authorize guests, restart devices, power-cycle PoE ports,
   run speedtests, create backups.
-- **Two front ends, one core:** a stdio **MCP server** (17 tools) and a **CLI** that share
+- **Two front ends, one core:** a stdio **MCP server** (20 tools) and a **CLI** that share
   the same safety-guarded facade.
 - **Diagnostic loops:** `diagnose` / `watch` run read-only passes that flag offline
   devices, weak clients, subsystem warnings, and co-channel interference, and emit JSONL for
@@ -111,10 +111,36 @@ security properties, zero new surface.
 
 ```bash
 uv venv && source .venv/bin/activate && uv pip install -e ".[dev]"
-python -m pytest -q          # 47 tests: safety, radio logic, redaction, auth/CSRF, TLS pinning, facade, loops
+python -m pytest -q          # tests: safety, radio logic, redaction, auth/CSRF, TLS pinning, facade, loops
 ruff check src tests
 ```
 
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+## Recorded scans and weekly improvements
+
+`network-scan` records inventory, known clients, configuration, operating radio statistics,
+link errors, usage history and latency in private SQLite storage. It can also discover LAN
+responders and run an explicitly confirmed gateway speedtest.
+
+```sh
+unifi-agent network-scan --discover
+unifi-agent network-scan --discover --speedtest --confirm
+unifi-agent network-history --limit 12
+unifi-agent network-history --scan-id SCAN_UUID
+```
+
+The database defaults to `~/.local/share/unifi-agent/history.sqlite3`; it is not stored in
+Git. Partial and failed collections remain visible. Read-only mode prohibits active
+speedtests. Client PHY rates are retained separately from actual WAN speedtest results.
+
+The Tuesday maintenance workflow uses `network-tune`, `network-outcome`, and
+`network-rollback` for bounded, backed-up radio/Smart Queue experiments. No setting changes
+are chosen automatically by the scanner: the scheduled agent assesses evidence, records
+a hypothesis, verifies results and accepts or rolls back each experiment. The maintenance
+executor has its own narrow validation and recovery checks; it does not expose arbitrary
+network writes. Its writes are audited and respect `UNIFI_MAX_BLAST_RADIUS`: radio changes
+are `device`, and Smart Queue changes are `gateway`. Rollbacks restore the recorded settings
+even above the ceiling. Monitoring notes and network plans are kept outside this repository.

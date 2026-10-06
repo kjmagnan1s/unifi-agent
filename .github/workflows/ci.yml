@@ -16,9 +16,11 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
       - name: Set up Python
-        run: uv python install ${{ matrix.python-version }}
+        run: |
+          uv venv --python ${{ matrix.python-version }}
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Install
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install -e ".[dev]"
       - name: Lint
         run: ruff check src tests
       - name: Test

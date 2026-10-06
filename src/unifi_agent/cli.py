@@ -10,6 +10,9 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -33,12 +36,18 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-def _run(coro: Any) -> Any:
+@contextmanager
+def _errors() -> Iterator[None]:
     try:
-        return asyncio.run(coro)
+        yield
     except UniFiAgentError as exc:
         err_console.print(f"[red]{type(exc).__name__}:[/red] {exc}")
         raise typer.Exit(1) from exc
+
+
+def _run(coro: Any) -> Any:
+    with _errors():
+        return asyncio.run(coro)
 
 
 def _emit(data: Any, as_json: bool) -> None:
@@ -356,6 +365,98 @@ def backup() -> None:
 
 
 # --- diagnostics & loops ------------------------------------------------------
+
+@app.command(name="network-scan")
+def network_scan(
+    database: Path | None = None,
+    samples: int = typer.Option(3, min=1, max=12),
+    interval: int = typer.Option(20, min=0, max=300),
+    speedtest: bool = False,
+    confirm: bool = False,
+    discover: bool = False,
+) -> None:
+    """Save inventory, usage, RF, configuration and latency to private SQLite history."""
+    from .history import History
+    from .scan import collect
+
+    if speedtest and not confirm:
+        raise typer.BadParameter("--speedtest saturates WAN briefly; also supply --confirm")
+
+    async def run():
+        settings = load_settings()
+        with History(database) as history:
+            result = await collect(UniFiAgent(settings), history, samples=samples,
+                                   interval=interval, active_speedtest=speedtest, discover=discover)
+            return {"scan_id": result["id"], "status": result["status"],
+                    "database": str(history.path), "assessment": result["assessment"],
+                    "speedtest": result.get("speedtest"), "comparison": result["comparison"]}
+
+    result = _run(run())
+    _emit(result, True)
+    if result["status"] == "failed":
+        raise typer.Exit(1)
+
+
+@app.command(name="network-history")
+def network_history(database: Path | None = None, scan_id: str | None = None,
+                    limit: int = typer.Option(12, min=1, max=100), experiments: bool = False) -> None:
+    """Read saved scans or the experiment journal without connecting to the network."""
+    from .history import History
+
+    with _errors(), History(database, read_only=True) as history:
+        result = history.get(scan_id) if scan_id else (history.experiments() if experiments else history.list(limit))
+    _emit(result, True)
+
+
+@app.command(name="network-tune")
+def network_tune(plan_file: Path, database: Path | None = None, confirm: bool = False) -> None:
+    """Run one backed-up radio/Smart Queue experiment during the Tuesday window."""
+    from .history import History
+    from .maintenance import experiment, validate_plan
+
+    plan = jsonlib.loads(plan_file.read_text())
+    with History(database) as history:
+        with _errors():
+            validate_plan(plan, history.get(plan["baseline_id"]))
+        if not confirm:
+            _emit({"applied": False, "plan": plan}, True)
+            return
+        _emit(_run(_with(lambda agent: experiment(agent, history, plan))), True)
+
+
+@app.command(name="network-rollback")
+def network_rollback(experiment_id: str, database: Path | None = None, confirm: bool = False) -> None:
+    """Restore exact experiment settings; recovery is allowed outside the change window."""
+    from .history import History
+    from .maintenance import rollback
+
+    if not confirm:
+        _emit({"applied": False, "experiment_id": experiment_id, "action": "rollback"}, True)
+        return
+    with History(database) as history:
+        _run(_with(lambda agent: rollback(agent, history, experiment_id)))
+    _emit({"experiment_id": experiment_id, "status": "rolled_back"}, True)
+
+
+@app.command(name="network-outcome")
+def network_outcome(experiment_id: str, evidence_file: Path, database: Path | None = None) -> None:
+    """Accept an experiment after recording its measured before/after evidence."""
+    from .history import History
+
+    evidence = jsonlib.loads(evidence_file.read_text())
+    if not all(evidence.get(k) for k in ("post_scan_id", "measured_benefit", "regression_checks")):
+        raise typer.BadParameter("Outcome needs post_scan_id, measured_benefit and regression_checks")
+    with _errors(), History(database) as history:
+        entry = history.experiment_entry(experiment_id)
+        if entry["events"][-1]["status"] != "pending_assessment":
+            raise typer.BadParameter("Only pending_assessment experiments can be accepted")
+        linked_id = entry["events"][-1]["payload"]["post_scan_id"]
+        if linked_id != evidence["post_scan_id"]:
+            raise typer.BadParameter("Outcome must reference the experiment's post-change scan")
+        if history.get(linked_id)["status"] == "failed":
+            raise typer.BadParameter("Cannot accept an experiment with a failed post-change scan")
+        history.event(experiment_id, "accepted", evidence)
+    _emit({"experiment_id": experiment_id, "status": "accepted"}, True)
 
 @app.command()
 def diagnose(json: bool = typer.Option(False, "--json")) -> None:

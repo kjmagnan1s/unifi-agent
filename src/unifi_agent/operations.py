@@ -70,6 +70,11 @@ OPERATIONS: dict[str, Operation] = {
         disruption="Reprovisions every AP broadcasting this WLAN group; all their "
                    "wireless clients drop for ~30-60s.",
     ),
+    "update_wan_queue": Operation(
+        "update_wan_queue", BlastRadius.GATEWAY, provisions=True,
+        disruption="Reprovisions the gateway's WAN Smart Queue settings; internet traffic "
+                   "can pause briefly.",
+    ),
     "update_wlan": Operation(
         "update_wlan", BlastRadius.WLAN_GROUP, provisions=True,
         disruption="Reprovisions every AP broadcasting this WLAN group; all their "
